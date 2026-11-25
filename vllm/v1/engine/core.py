@@ -1070,6 +1070,15 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
+            if (
+                os.getenv("KS_LMCACHE_ADMIT_DURING_MODEL_WAIT") == "1"
+                and vllm_config.parallel_config.data_parallel_size == 1
+                and not self.has_coordinator
+                and self.scheduler.get_kv_connector() is not None
+            ):
+                self.model_executor.on_model_wait = self._admit_next_generation_request
+                self._admitted_during_model_wait = 0
+
             # Background Threads and Queues for IO. These enable us to
             # overlap ZMQ socket IO with GPU since they release the GIL,
             # and to overlap some serialization/deserialization with the
@@ -1364,6 +1373,26 @@ class EngineCoreProc(EngineCore):
             self._process_engine_step()
 
         raise SystemExit
+
+    def _admit_next_generation_request(self) -> None:
+        """Use the engine owner thread to enqueue one ADD while workers execute."""
+        if not self.is_running():
+            return
+        # The socket thread appends. This engine thread is the sole consumer.
+        # Keep control, shutdown, pooling and streaming requests in FIFO order.
+        with self.input_queue.mutex:
+            if not self.input_queue.queue:
+                return
+            kind, payload = self.input_queue.queue[0]
+            if kind != EngineCoreRequestType.ADD:
+                return
+            req, _ = payload
+            if req.pooling_params is not None or req.resumable or req.abort_immediately:
+                return
+        self._handle_client_request(*self.input_queue.get_nowait())
+        self._admitted_during_model_wait += 1
+        if self._admitted_during_model_wait == 1 or self._admitted_during_model_wait % 256 == 0:
+            logger.info("LMCache ADD during model wait: count=%d", self._admitted_during_model_wait)
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
