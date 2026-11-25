@@ -216,6 +216,8 @@ def run_headless(args: argparse.Namespace):
             head_node_address,
         )
 
+        from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
         executor = MultiprocExecutor(vllm_config, monitor_workers=False)
         executor.start_worker_monitor(inline=True)
         return
