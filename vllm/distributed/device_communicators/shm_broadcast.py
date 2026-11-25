@@ -724,6 +724,20 @@ class MessageQueue:
                 self._spin_condition.record_read()
                 break
 
+    def reply_readable(self) -> bool:
+        """Peek the next FIFO reply, including its overflow payload."""
+        if self.shutting_down:
+            return True
+        if self._is_local_reader:
+            with self.buffer.get_metadata(self.current_idx) as flags:
+                memory_fence()
+                if not flags[0] or flags[self.local_reader_rank + 1]:
+                    return False
+                with self.buffer.get_data(self.current_idx) as data:
+                    return data[0] != 1 or bool(self.local_socket.poll(timeout=0))
+        assert self._is_remote_reader
+        return bool(self.remote_socket.poll(timeout=0))
+
     def enqueue(self, obj, timeout: float | None = None):
         """Write to message queue with optional timeout (in seconds)"""
         assert self._is_writer, "Only writers can enqueue"

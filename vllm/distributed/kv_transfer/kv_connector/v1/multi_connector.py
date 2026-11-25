@@ -3,6 +3,7 @@
 import copy
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from threading import Event
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -46,6 +47,13 @@ logger = init_logger(__name__)
 class MultiKVConnectorMetadata(KVConnectorMetadata):
     metadata: tuple[KVConnectorMetadata, ...]
     extra_async_saves: dict[str, int] | None = None
+
+    def is_idle_pp_step(self) -> bool:
+        """All children must explicitly attest that their metadata is idle."""
+        return not self.extra_async_saves and all(
+            getattr(child, "is_idle_pp_step", lambda: False)()
+            for child in self.metadata
+        )
 
 
 @dataclass
@@ -539,6 +547,15 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def take_events(self) -> Iterable["KVCacheEvent"]:
         for c in self._connectors:
             yield from c.take_events()
+
+    def set_pp_lookup_wakeup(self, wakeup: Event) -> bool:
+        """Subscribe to lookup progress on children that support host wakeups."""
+        registered = False
+        for connector in self._connectors:
+            register = getattr(connector, "set_pp_lookup_wakeup", None)
+            if register is not None:
+                registered |= register(wakeup)
+        return registered
 
     def has_pending_push_work(self) -> bool:
         return any(c.has_pending_push_work() for c in self._connectors)

@@ -73,7 +73,9 @@ class FutureWrapper(Future):
         futures_queue: deque["FutureWrapper"],
         get_response: Callable[[], Any],
         aggregate: Callable = lambda x: x,
+        reply_readable: Callable[[], bool] | None = None,
     ):
+        self.reply_readable = reply_readable
         self.futures_queue = futures_queue
         self.get_response = get_response
         self.aggregate = aggregate
@@ -89,6 +91,19 @@ class FutureWrapper(Future):
             future = self.futures_queue.pop()
             future._wait_for_response()
         return super().result()
+
+    def poll(self) -> bool:
+        """Drain only readable FIFO replies, leaving unread messages in place."""
+        while not self.done():
+            head = self.futures_queue[-1]
+            if head.reply_readable is None:
+                # A backend without a readiness probe must retire normally.
+                return True
+            if not head.reply_readable():
+                return False
+            self.futures_queue.pop()
+            head._wait_for_response()
+        return True
 
     def _wait_for_response(self):
         try:
@@ -401,8 +416,14 @@ class MultiprocExecutor(Executor):
                 responses.append(result)
             return responses[0] if output_rank is not None else responses
 
+        def reply_readable() -> bool:
+            return (
+                deadline is not None and time.monotonic() >= deadline
+            ) or all(mq.reply_readable() for mq in response_mqs)
+
         future = FutureWrapper(
-            self.futures_queue, get_response=get_response, aggregate=aggregate
+            self.futures_queue, get_response=get_response, aggregate=aggregate,
+            reply_readable=reply_readable,
         )
 
         return future if non_block else future.result()

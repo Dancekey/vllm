@@ -614,6 +614,69 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
+    def _pp_is_empty_step(self, step: SchedulerOutput) -> bool:
+        """Identify an idle PP step, including work reported only on workers."""
+        if (
+            step.total_num_scheduled_tokens
+            or step.scheduled_new_reqs
+            or step.scheduled_cached_reqs.req_ids
+            or step.scheduled_spec_decode_tokens
+            or step.scheduled_encoder_inputs
+            or step.has_structured_output_requests
+            or step.pending_structured_output_tokens
+            or step.num_invalid_spec_tokens
+            or step.finished_req_ids
+            or step.preempted_req_ids
+            or step.free_encoder_mm_hashes
+            or step.new_block_ids_to_zero
+            or step.kv_cache_block_copies
+            or step.ec_connector_metadata is not None
+        ):
+            return False
+        metadata = step.kv_connector_metadata
+        if metadata is not None:
+            is_idle = getattr(metadata, "is_idle_pp_step", None)
+            if is_idle is None or not is_idle():
+                return False
+        connector = self.scheduler.get_kv_connector()
+        return (
+            not self.scheduler.has_finished_requests()
+            and (connector is None or not connector.has_pending_push_work())
+            and not any(
+                req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                for queue in (self.scheduler.waiting, self.scheduler.skipped_waiting)
+                for req in queue
+            )
+        )
+
+    def _wait_for_pp_refill(self, oldest: Future[ModelRunnerOutput]) -> bool:
+        """Wait for real work or the FIFO result while a PP position is free."""
+        poll = getattr(oldest, "poll", None)
+        if poll is None:
+            return False
+        while self.is_running() and not poll():
+            if not self.input_queue.empty():
+                self._process_input_queue()
+                return self.is_running()
+            if self._pp_lookup_wakeup.wait(timeout=0.001):
+                return self.is_running()
+        return False
+
+    def _trace_pp_dispatch(self, step: SchedulerOutput) -> None:
+        """Mark sampled PP host RPCs for matching to a device profile."""
+        every = getattr(self, "_pp_trace_every", 0)
+        if not every or not step.total_num_scheduled_tokens:
+            return
+        self._pp_trace_count += 1
+        if self._pp_trace_count % every == 0:
+            step.pp_batch_trace_id = time.monotonic_ns()
+            logger.info(
+                "PP0_DISPATCH batch=%d tokens=%d in_flight=%d",
+                step.pp_batch_trace_id,
+                step.total_num_scheduled_tokens,
+                len(self.batch_queue),
+            )
+
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
@@ -625,9 +688,9 @@ class EngineCore:
         If a new batch is scheduled, directly return an empty engine core
         output. In other words, fulfilling the batch queue has a higher priority
         than getting model outputs.
-        2. If there is no new scheduled batch, meaning that the batch queue
-        is full or no other requests can be scheduled, we block until the first
-        batch in the job queue is finished.
+        2. When enabled for PP, an idle step leaves the queue position free
+           and waits for ingress, a lookup reply, or the oldest worker result.
+           Otherwise continue to the usual FIFO retirement.
         3. Update the scheduler from the output.
         """
 
@@ -641,8 +704,22 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        scheduler_output = None
+        refill = getattr(self, "_pp_refill_enabled", False)
+        while self.scheduler.has_requests():
+            if refill:
+                # Clear before scheduling so an RPC completing during schedule
+                # can wake the owner thread if this attempt finds no work.
+                self._pp_lookup_wakeup.clear()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            if not refill or not self._pp_is_empty_step(scheduler_output):
+                break
+            scheduler_output = None
+            if not batch_queue or not self._wait_for_pp_refill(batch_queue[-1][0]):
+                break
+
+        if scheduler_output is not None:
+            self._trace_pp_dispatch(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -1115,6 +1192,25 @@ class EngineCoreProc(EngineCore):
                     raise RuntimeError("Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
+
+            pp_config = vllm_config.parallel_config
+            if pp_config.pipeline_parallel_size == 2 and pp_config.data_parallel_size == 1:
+                self._pp_trace_every = int(os.getenv("KS_PP_DISPATCH_TRACE_EVERY", "0"))
+                self._pp_trace_count = 0
+                if (
+                    os.getenv("KS_PP_EMPTY_REFILL") == "1"
+                    and pp_config.distributed_executor_backend == "mp"
+                    and not self.has_coordinator
+                    and not vllm_config.use_v2_model_runner
+                    and self.async_scheduling
+                    and self.is_ec_consumer
+                    and not self.is_pooling_model
+                ):
+                    connector = self.scheduler.get_kv_connector()
+                    register = getattr(connector, "set_pp_lookup_wakeup", None)
+                    if register is not None:
+                        self._pp_lookup_wakeup = threading.Event()
+                        self._pp_refill_enabled = register(self._pp_lookup_wakeup)
 
     @contextmanager
     def _perform_handshakes(
