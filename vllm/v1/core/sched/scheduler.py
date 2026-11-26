@@ -2693,6 +2693,13 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
+            if os.environ.get("AGY_MP_TRACE_DIR"):
+                try:
+                    from lmcache.v1.multiprocess.pp_bubble_trace import emit_event as _agy_emit
+
+                    _agy_emit("sched.remote_kv_resumed", request_id=request.request_id)
+                except Exception:
+                    pass
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
