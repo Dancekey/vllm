@@ -382,7 +382,10 @@ class MultiprocExecutor(Executor):
 
         def get_response():
             responses = []
+            on_wait = getattr(self, "on_model_wait", None) if non_block else None
             for mq in response_mqs:
+                if on_wait is not None and method in ("execute_model", "sample_tokens"):
+                    mq.wait_readable_servicing(on_wait, deadline)
                 dequeue_timeout = (
                     None if deadline is None else (deadline - time.monotonic())
                 )

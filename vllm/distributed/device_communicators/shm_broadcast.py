@@ -769,6 +769,29 @@ class MessageQueue:
         if self.n_remote_reader > 0:
             self.remote_socket.send_multipart(all_buffers, copy=False)
 
+    def wait_readable_servicing(self, on_wait, deadline: float | None) -> None:
+        """Service ingress between bounded readiness checks. Never consume a reply."""
+        while not self.shutting_down:
+            if self._is_local_reader:
+                with self.buffer.get_metadata(self.current_idx) as flags:
+                    memory_fence()
+                    if flags[0] and not flags[self.local_reader_rank + 1]:
+                        return
+            elif self._is_remote_reader:
+                if self.remote_socket.poll(timeout=0):
+                    return
+            else:
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            on_wait()
+            # Locally sample the flags without taking a slot or consuming the
+            # cancellation socket. Remote ZMQ can wake us as soon as data lands.
+            if self._is_local_reader:
+                time.sleep(0.002)
+            elif self.remote_socket.poll(timeout=2):
+                return
+
     def dequeue(
         self,
         timeout: float | None = None,
